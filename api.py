@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from memory_agent import SupportAgent
 from memory_agent.engine import build_engine
 from memory_agent.models import Memory
-from memory_agent.store import HindsightStore, InMemoryStore
+from memory_agent.store import HindsightStore, InMemoryStore, build_store
 
 STORE_PATH = Path(os.getenv("MEMORY_STORE_PATH", "memory_store.json"))
 
@@ -34,7 +34,9 @@ app = FastAPI(
 
 
 def _make_agent() -> SupportAgent:
-    store = HindsightStore() if os.getenv("HINDSIGHT_URL") else InMemoryStore(STORE_PATH)
+    # build_store is the one place that decides which backend is live, and it
+    # wraps Hindsight so an unreachable instance degrades to local JSON.
+    store = build_store(STORE_PATH)
     return SupportAgent(store=store, engine=build_engine())
 
 
@@ -128,9 +130,12 @@ def add_profile(customer_id: str, req: ProfileRequest) -> dict:
 
 @app.post("/admin/reset")
 def reset() -> dict:
+    """Wipe memory. Local store clears the file; Hindsight banks are cleared
+    per customer through the store, not by deleting a local file."""
     global agent
-    if isinstance(agent.store, HindsightStore):
-        raise HTTPException(400, "Cannot reset a remote Hindsight bank from the demo endpoint")
-    STORE_PATH.unlink(missing_ok=True)
+    for customer_id in list(agent.store.customers()):
+        agent.store.forget(customer_id)
+    if isinstance(agent.store, InMemoryStore):
+        STORE_PATH.unlink(missing_ok=True)
     agent = _make_agent()
     return {"status": "reset"}

@@ -271,6 +271,82 @@ class HindsightStore:
             return pool.submit(asyncio.run, coroutine).result()
 
 
+class ResilientStore:
+    """A store that keeps answering when its backend stops answering.
+
+    Hindsight is a network service, and a demo that dies because an instance
+    is asleep, rate-limited, or on a hotel wifi is worse than a demo that says
+    so. Once a call to the real store raises for a reason that is not the
+    caller's fault, every later call goes to a local store instead and
+    ``degraded_reason`` records why.
+
+    The switch is one-way on purpose. Flipping back mid-session would split a
+    customer's history across two backends, and the agent would then answer
+    from a memory that never existed as far as it can tell.
+    """
+
+    _TRANSIENT = (OSError, TimeoutError, ConnectionError, asyncio.TimeoutError)
+
+    def __init__(self, primary: MemoryStore, fallback: MemoryStore) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.degraded_reason: str | None = None
+
+    @property
+    def name(self) -> str:
+        if self.degraded_reason:
+            return f"{_label(self.primary)} (unavailable, using local)"
+        return _label(self.primary)
+
+    def _call(self, method: str, *args, **kwargs):
+        if self.degraded_reason is None:
+            try:
+                return getattr(self.primary, method)(*args, **kwargs)
+            except self._TRANSIENT as exc:
+                # A refused connection, DNS failure, or timeout means the
+                # service is not there -- not that the memory is missing.
+                self.degraded_reason = f"{type(exc).__name__}: {exc}"[:200]
+            except Exception as exc:  # noqa: BLE001 - see note below
+                # A client-side error from the SDK (bad auth shape, malformed
+                # response) means this adapter is wrong, and falling back would
+                # hide that behind a working-looking demo. Re-raise.
+                if _is_client_error(exc):
+                    raise
+                self.degraded_reason = f"{type(exc).__name__}: {exc}"[:200]
+        return getattr(self.fallback, method)(*args, **kwargs)
+
+    def add(self, memory: Memory) -> Memory:
+        return self._call("add", memory)
+
+    def update(self, memory: Memory) -> Memory:
+        return self._call("update", memory)
+
+    def all(self, customer_id: str) -> list[Memory]:
+        return self._call("all", customer_id)
+
+    def customers(self) -> list[str]:
+        return self._call("customers")
+
+    def forget(self, customer_id: str) -> int:
+        return self._call("forget", customer_id)
+
+    def search(self, customer_id: str, query: str, limit: int = 5):
+        return self._call("search", customer_id, query, limit)
+
+
+def _is_client_error(exc: Exception) -> bool:
+    """4xx means the request was wrong, so do not paper over it."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if isinstance(status, int):
+        return 400 <= status < 500
+    code = getattr(exc, "code", None)
+    return isinstance(code, str) and code.isdigit() and 400 <= int(code) < 500
+
+
+def _label(store: object) -> str:
+    return type(store).__name__.replace("Store", "") or "memory"
+
+
 def _iter_items(payload: object, key: str) -> list:
     """Hindsight responses are pydantic models or plain dicts depending on
     version; unwrap ``{key: [...]}`` or take the model as a sequence."""
@@ -370,7 +446,16 @@ def _coerce(enum_cls, value, default):
 
 
 def build_store(path: str | Path | None = None) -> Iterable[MemoryStore]:
-    """Pick the real service if configured, otherwise the local store."""
+    """Pick the real service if configured, otherwise the local store.
+
+    When Hindsight is configured it is wrapped in a ``ResilientStore``, so a
+    configured-but-unreachable instance degrades to local JSON instead of
+    taking the page down. The local store is the fallback, not a secret: a
+    judge with no Hindsight instance still gets a working demo, and the header
+    says which one is actually live.
+    """
     if os.getenv("HINDSIGHT_URL"):
-        return HindsightStore()  # type: ignore[return-value]
+        return ResilientStore(  # type: ignore[return-value]
+            HindsightStore(), InMemoryStore(path)
+        )
     return InMemoryStore(path)  # type: ignore[return-value]

@@ -18,7 +18,7 @@ import streamlit as st
 from memory_agent import SupportAgent
 from memory_agent.engine import build_engine
 from memory_agent.models import MemoryKind, Outcome
-from memory_agent.store import HindsightStore, InMemoryStore
+from memory_agent.store import HindsightStore, InMemoryStore, build_store
 
 st.set_page_config(page_title="Support Memory Console", layout="wide")
 
@@ -70,7 +70,9 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 @st.cache_resource
 def get_agent() -> SupportAgent:
-    store = HindsightStore() if os.getenv("HINDSIGHT_URL") else InMemoryStore(STORE_PATH)
+    # build_store is the one place that decides which backend is live, and it
+    # wraps Hindsight so an unreachable instance degrades to local JSON.
+    store = build_store(STORE_PATH)
     return SupportAgent(store=store, engine=build_engine())
 
 
@@ -91,18 +93,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 store_name = "Hindsight" if os.getenv("HINDSIGHT_URL") else "Local JSON"
-# A live model that is failing is a configuration problem, not a memory
-# problem, so it is surfaced in the environment strip rather than as a page-wide
-# warning. A console should not greet every operator with a stack-trace-shaped
-# banner just because the optional model backend is misconfigured.
+# A backend that is configured but not answering is a configuration problem,
+# not a memory problem, so it is surfaced in the environment strip rather than
+# as a page-wide warning. A console should not greet every operator with a
+# stack-trace-shaped banner just because an optional backend is misconfigured.
 if getattr(agent.engine, "degraded_reason", None):
     engine_name = f"{agent.engine.name} (unavailable, using fallback)"
 else:
     engine_name = agent.engine.name
+if getattr(agent.store, "degraded_reason", None):
+    store_name = "Hindsight (unavailable, using local)"
+try:
+    customer_count = len(agent.store.customers())
+except Exception:  # noqa: BLE001 - the header must never be what breaks the page
+    customer_count = 0
 st.markdown(
     f'<div class="env-strip">Memory store <b>{store_name}</b> &nbsp;·&nbsp; '
     f'Reasoning engine <b>{engine_name}</b> &nbsp;·&nbsp; '
-    f'Customers on file <b>{len(agent.store.customers())}</b></div>',
+    f'Customers on file <b>{customer_count}</b></div>',
     unsafe_allow_html=True,
 )
 

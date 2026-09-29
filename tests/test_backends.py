@@ -35,7 +35,8 @@ import pytest
 from memory_agent import SupportAgent
 from memory_agent.engine import LLMEngine, ScriptedEngine, build_engine
 from memory_agent.models import Memory, MemoryKind, Outcome, RetrievedMemory
-from memory_agent.store import HindsightStore, build_store
+from memory_agent.store import (HindsightStore, InMemoryStore, ResilientStore,
+                                build_store)
 
 
 # --------------------------------------------------------------- LLM engine
@@ -447,7 +448,51 @@ def test_hindsight_store_refuses_to_build_without_a_url(monkeypatch):
 def test_hindsight_is_selected_when_configured(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_URL", "http://hindsight.test")
     monkeypatch.setattr("hindsight_client.Hindsight", lambda **kw: FakeHindsight())
-    assert isinstance(build_store(), HindsightStore)
+    store = build_store()
+    assert isinstance(store, ResilientStore)
+    assert isinstance(store.primary, HindsightStore)
+
+
+def test_an_unreachable_hindsight_degrades_instead_of_breaking_the_page():
+    """A demo that dies because an instance is asleep, or the wifi is a hotel's,
+    is worse than one that says so. Every call must land somewhere."""
+    class Dead:
+        def __getattr__(self, name):
+            def boom(*a, **k):
+                raise OSError("Connection refused")
+            return boom
+
+    store = ResilientStore(Dead(), InMemoryStore())
+    assert store.degraded_reason is None
+
+    store.add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT, text="Restart"))
+
+    assert "Connection refused" in store.degraded_reason
+    assert store.all("CUST-1")[0].text == "Restart"
+    assert store.search("CUST-1", "restart")
+    assert "unavailable" in store.name
+    # The switch is one-way on purpose: flipping back mid-session would split a
+    # customer's history across two backends, and the agent would then answer
+    # from a memory that never existed as far as it can tell.
+    store.degraded_reason = None
+    assert store.all("CUST-1")[0].text == "Restart"
+
+
+def test_a_client_error_is_not_hidden_behind_the_fallback():
+    """4xx means this adapter sent something wrong. Falling back would produce
+    a working-looking demo that silently never reaches Hindsight."""
+    class Rejecting:
+        def __getattr__(self, name):
+            def boom(*a, **k):
+                error = RuntimeError("422 unprocessable")
+                error.status_code = 422
+                raise error
+            return boom
+
+    store = ResilientStore(Rejecting(), InMemoryStore())
+    with pytest.raises(RuntimeError, match="422"):
+        store.add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT, text="x"))
+    assert store.degraded_reason is None
 
 def test_local_store_is_the_default_without_configuration(monkeypatch):
     """Same reason as the scripted engine: a judge runs it with no env set."""
