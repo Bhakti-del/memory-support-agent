@@ -291,6 +291,35 @@ def test_negated_success_is_not_read_as_success(agent):
     assert agent._verdict("the problem persists") is Outcome.FAILED
 
 
+def test_a_fix_after_a_failure_in_the_same_clause_is_not_swallowed(agent):
+    """The defect: verdicts were read per clause, so the first signal in
+    'cleared the cache, still crashing, updated the app and it fixed it' was
+    applied to every step, and a working step was stored as a failure. The
+    agent then told the customer every step had failed — the one thing a
+    support agent must never get wrong."""
+    assert agent._extract_observations(
+        "Cleared the cache, still crashing. Updated the app and it fixed it."
+    ) == [("Cleared application cache", Outcome.FAILED),
+          ("Update application", Outcome.WORKED)]
+
+
+def test_an_unpunctuated_rundown_keeps_the_fix_at_the_end(agent):
+    """How a customer actually types it, with no punctuation at all."""
+    assert agent._extract_observations(
+        "My Acme PDF Suite crashes whenever I upload a large PDF I restarted it "
+        "but that did not help Cleared the cache, still crashing Updated the "
+        "app and it fixed it"
+    ) == [("Restart application", Outcome.FAILED),
+          ("Cleared application cache", Outcome.FAILED),
+          ("Update application", Outcome.WORKED)]
+
+
+def test_a_step_between_two_signals_is_judged_by_the_nearer_one(agent):
+    assert agent._extract_observations(
+        "It worked, then it broke again, I cleared the cache, still crashing"
+    ) == [("Cleared application cache", Outcome.FAILED)]
+
+
 def test_full_one_shot_message_is_understood(agent):
     observations = agent._extract_observations(
         "My Acme PDF Suite crashes on large PDF upload. I restarted it and cleared "

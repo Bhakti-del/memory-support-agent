@@ -91,12 +91,21 @@ st.markdown(
     unsafe_allow_html=True,
 )
 store_name = "Hindsight" if os.getenv("HINDSIGHT_URL") else "Local JSON"
+# A live model that is failing is a configuration problem, not a memory
+# problem, so it is surfaced in the environment strip rather than as a page-wide
+# warning. A console should not greet every operator with a stack-trace-shaped
+# banner just because the optional model backend is misconfigured.
+if getattr(agent.engine, "degraded_reason", None):
+    engine_name = f"{agent.engine.name} (unavailable, using fallback)"
+else:
+    engine_name = agent.engine.name
 st.markdown(
     f'<div class="env-strip">Memory store <b>{store_name}</b> &nbsp;·&nbsp; '
-    f'Reasoning engine <b>{agent.engine.name}</b> &nbsp;·&nbsp; '
+    f'Reasoning engine <b>{engine_name}</b> &nbsp;·&nbsp; '
     f'Customers on file <b>{len(agent.store.customers())}</b></div>',
     unsafe_allow_html=True,
 )
+
 st.divider()
 
 # ------------------------------------------------------------------ sidebar

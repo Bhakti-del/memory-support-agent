@@ -22,7 +22,7 @@ import httpx
 import pytest
 
 from memory_agent import SupportAgent
-from memory_agent.engine import LLMEngine, build_engine
+from memory_agent.engine import LLMEngine, ScriptedEngine, build_engine
 from memory_agent.models import Memory, MemoryKind, Outcome, RetrievedMemory
 from memory_agent.store import HindsightStore, build_store
 
@@ -126,6 +126,62 @@ def test_scripted_engine_is_the_default_without_a_key(monkeypatch):
     """The demo must run for a judge who has not configured anything."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert build_engine().name == "scripted"
+
+
+def test_llm_engine_sends_no_temperature_to_a_client_that_dropped_it():
+    """Anthropic removed `temperature` in SDK 1.9.0. Passing it anyway raises
+    TypeError on every call, which the whole test suite misses because the
+    other tests inject a fake client."""
+    client = FakeClient()
+    LLMEngine(client=client).reply("hi", [], False)
+    assert "temperature" not in client.messages.calls[0]
+
+
+def test_llm_engine_still_sends_temperature_when_the_client_accepts_it():
+    class LegacyMessages:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, *, temperature=None, **kwargs):
+            self.calls.append({"temperature": temperature, **kwargs})
+            return type("M", (), {"content": [type("B", (), {"text": "ok"})()]})()
+
+    messages = LegacyMessages()
+    client = type("C", (), {"messages": messages})()
+    LLMEngine(client=client, temperature=0.2).reply("hi", [], False)
+    assert messages.calls[0]["temperature"] == 0.2
+
+
+def test_a_failed_model_call_degrades_instead_of_crashing_the_demo():
+    """A 400 for an exhausted credit balance, or a network blip mid-demo, must
+    not reach the customer as a stack trace. The answer gets plainer; the
+    conversation keeps going."""
+    class BrokenMessages:
+        def create(self, **kwargs):
+            raise RuntimeError("credit balance is too low")
+
+    client = type("C", (), {"messages": BrokenMessages()})()
+    engine = LLMEngine(client=client, fallback=ScriptedEngine())
+
+    text = engine.reply("crashes on large PDF", [], False)
+
+    assert "no history on file" in text
+    assert "credit balance is too low" in engine.degraded_reason
+
+
+def test_a_failed_model_call_still_raises_when_there_is_no_fallback():
+    client = type("C", (), {"messages": type(
+        "M", (), {"create": lambda self, **k: (_ for _ in ()).throw(RuntimeError("down"))}
+    )()})()
+    with pytest.raises(RuntimeError):
+        LLMEngine(client=client).reply("hi", [], False)
+
+
+def test_the_keyed_engine_carries_a_fallback_so_a_demo_cannot_die(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-not-a-real-key")
+    engine = build_engine()
+    assert engine.name == "llm"
+    assert engine._fallback is not None
 
 
 # ---------------------------------------------------------- Hindsight store

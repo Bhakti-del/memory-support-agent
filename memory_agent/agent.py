@@ -188,23 +188,40 @@ class SupportAgent:
     def _extract_observations(self, message: str) -> list[tuple[str, Outcome]]:
         """Read (step, outcome) pairs out of one message.
 
-        One clause can name several steps ("I restarted it and cleared the
-        cache"), and the verdict can land in a later clause ("...but neither
-        helped"), so verdicts are matched positionally against the clause that
-        follows when the step's own clause is silent.
+        Verdicts are attached by position, not per clause. A clause can hold
+        both a failure and a success -- "cleared the cache, still crashing,
+        updated the app and it fixed it" -- and a single verdict per clause
+        makes the first one swallow the rest, recording a working step as a
+        failure. So each step takes the nearest verdict that follows it,
+        falling back to the nearest one before it, then to the next clause's
+        verdict when its own clause says nothing ("...but neither helped").
         """
         pairs: list[tuple[str, Outcome]] = []
         clauses = _clauses(message)
-        verdicts = [self._verdict(c) for c in clauses]
+        clause_verdicts = [self._verdict(c) for c in clauses]
 
         for index, clause in enumerate(clauses):
-            labels = self._step_labels(clause)
-            if not labels:
+            steps = self._step_spans(clause)
+            if not steps:
                 continue
-            verdict = verdicts[index]
-            if verdict is Outcome.IN_PROGRESS and index + 1 < len(clauses):
-                verdict = verdicts[index + 1]
-            pairs += [(label, verdict) for label in labels]
+            marks = _verdict_spans(clause)
+            for label, start, end in steps:
+                verdict = Outcome.IN_PROGRESS
+                # Nearest verdict after the step: "updated the app and it
+                # fixed it" is judged by the fix, not the crash before it.
+                later = [m for m in marks if m[0] >= end]
+                if later:
+                    verdict = min(later, key=lambda m: m[0])[2]
+                else:
+                    earlier = [m for m in marks if m[1] <= start]
+                    if earlier:
+                        verdict = max(earlier, key=lambda m: m[1])[2]
+                    else:
+                        verdict = clause_verdicts[index]
+                        if (verdict is Outcome.IN_PROGRESS
+                                and index + 1 < len(clauses)):
+                            verdict = clause_verdicts[index + 1]
+                pairs.append((label, verdict))
 
         # A step mentioned twice takes its most informative verdict, and a step
         # with no verdict anywhere stays open rather than being dropped.
@@ -218,31 +235,18 @@ class SupportAgent:
         return [(label, best[label]) for label in order]
 
     @staticmethod
-    def _step_labels(clause: str) -> list[str]:
-        """Every step a clause describes, in the order they appear.
-
-        Patterns are matched with spans and the longest match at each position
-        wins, so "reinstalled" resolves to Reinstall once rather than matching
-        both the reinstall and the install patterns, and "cleared the
-        application cache" beats the bare "reset".
-        """
+    def _step_spans(clause: str) -> list[tuple[str, int, int]]:
+        """Each step a clause describes, with where it sits in the text."""
         matches: list[tuple[int, int, str]] = []
         for pattern, label in STEP_LEXICON:
             for match in re.finditer(pattern, clause, re.I):
                 matches.append((match.start(), match.end(), label))
+        return _resolve_spans(matches)
 
-        # Longest match first at a given start; drop any match that overlaps one
-        # already accepted.
-        matches.sort(key=lambda m: (m[0], -(m[1] - m[0])))
-        taken: list[tuple[int, int]] = []
-        found: list[str] = []
-        for start, end, label in matches:
-            if any(start < t_end and end > t_start for t_start, t_end in taken):
-                continue
-            taken.append((start, end))
-            if label not in found:
-                found.append(label)
-        return found
+    @staticmethod
+    def _step_labels(clause: str) -> list[str]:
+        """Every step a clause describes, in the order they appear."""
+        return [label for label, _, _ in SupportAgent._step_spans(clause)]
 
     def _step_label(self, clause: str) -> str | None:
         labels = self._step_labels(clause)
@@ -491,3 +495,40 @@ class SupportAgent:
 
 def _clauses(message: str) -> list[str]:
     return [c.strip() for c in CLAUSE_SPLIT.split(message) if c and c.strip()]
+
+
+def _resolve_spans(matches: list[tuple[int, int, str]]) -> list[tuple[str, int, int]]:
+    """Longest match wins at each position, overlaps dropped, order preserved.
+
+    "reinstalled" must resolve to Reinstall once rather than matching both the
+    reinstall and the install rules, and "cleared the application cache" must
+    beat the bare "reset" nested inside it.
+    """
+    matches.sort(key=lambda m: (m[0], -(m[1] - m[0])))
+    taken: list[tuple[int, int]] = []
+    found: list[tuple[str, int, int]] = []
+    for start, end, label in matches:
+        if any(start < t_end and end > t_start for t_start, t_end in taken):
+            continue
+        taken.append((start, end))
+        if label not in [label for label, _, _ in found]:
+            found.append((label, start, end))
+    return found
+
+
+def _verdict_spans(clause: str) -> list[tuple[int, int, Outcome]]:
+    """Every outcome signal in a clause, in text order.
+
+    Position matters: "still crashing ... it fixed it" holds two opposite
+    signals, and whichever step sits between them is judged by the nearer one.
+    Negation is checked first so "nothing worked" is never read as a success.
+    """
+    marks: list[tuple[int, int, Outcome]] = []
+    for match in NEGATED_WORKED.finditer(clause):
+        marks.append((match.start(), match.end(), Outcome.FAILED))
+    for match in FAILED_PATTERNS.finditer(clause):
+        marks.append((match.start(), match.end(), Outcome.FAILED))
+    for match in WORKED_PATTERNS.finditer(clause):
+        if not any(start <= match.start() < end for start, end, _ in marks):
+            marks.append((match.start(), match.end(), Outcome.WORKED))
+    return sorted(marks)

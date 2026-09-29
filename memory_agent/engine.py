@@ -6,8 +6,9 @@ always demonstrable. `LLMEngine` is the drop-in upgrade for a real model.
 
 from __future__ import annotations
 
+import inspect
 import os
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 from .models import Memory, MemoryKind, Outcome, RetrievedMemory, tokenize
 
@@ -149,10 +150,19 @@ class LLMEngine:
     name = "llm"
 
     def __init__(self, model: str = "claude-sonnet-5", temperature: float = 0.2,
-                 client: object | None = None) -> None:
+                 client: object | None = None,
+                 fallback: "Engine | None" = None) -> None:
         self.model = model
         self.temperature = temperature
         self._client = client
+        self._fallback = fallback
+        # Set when a live call fails, so the UI can surface it instead of
+        # silently serving weaker answers than the operator expects.
+        self._degraded_reason: str | None = None
+
+    @property
+    def degraded_reason(self) -> str | None:
+        return self._degraded_reason
 
     def _get_client(self):
         if self._client is None:
@@ -182,20 +192,57 @@ class LLMEngine:
             f"have just said is resolved."
         )
 
+    def _request_kwargs(self) -> dict[str, Any]:
+        """Build the API call, adapting to whichever SDK version is installed.
+
+        Anthropic removed `temperature` from `messages.create` in 1.9.0, so
+        passing it unconditionally raises TypeError against a current install
+        and would break the demo on the day. The parameter is included only when
+        the client actually accepts it.
+        """
+        kwargs: dict[str, Any] = {"max_tokens": 700}
+        try:
+            accepted = inspect.signature(self._get_client().messages.create).parameters
+        except (TypeError, ValueError):
+            accepted = {}
+        if "temperature" in accepted:
+            kwargs["temperature"] = self.temperature
+        return kwargs
+
     def reply(self, question: str, recalled: list[RetrievedMemory],
               is_returning: bool, just_learned: Sequence[Memory] = ()) -> str:
-        message = self._get_client().messages.create(
-            model=self.model,
-            max_tokens=700,
-            temperature=self.temperature,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": self.build_prompt(
-                question, recalled, is_returning, just_learned)}],
-        )
-        return message.content[0].text
+        """Answer via the model, degrading to scripted rather than failing.
+
+        A live call can fail for reasons that have nothing to do with this code:
+        an exhausted credit balance, a network blip, a rate limit mid-demo. A
+        support agent that shows a stack trace to a customer is worse than one
+        that gives a plainer answer, so any transport or billing failure falls
+        back to the deterministic engine and says so.
+        """
+        try:
+            message = self._get_client().messages.create(
+                model=self.model,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": self.build_prompt(
+                    question, recalled, is_returning, just_learned)}],
+                **self._request_kwargs(),
+            )
+            return message.content[0].text
+        except Exception as exc:  # noqa: BLE001 - any failure must degrade
+            self._degraded_reason = f"{type(exc).__name__}: {exc}"
+            if self._fallback is None:
+                raise
+            return self._fallback.reply(
+                question, recalled, is_returning, just_learned
+            )
 
 
 def build_engine() -> Engine:
+    """Prefer the real model when a key is present, but never without a net.
+
+    The scripted engine is wired in as a fallback so a credit or network
+    failure during a demo degrades the prose instead of ending it.
+    """
     if os.getenv("ANTHROPIC_API_KEY"):
-        return LLMEngine()
+        return LLMEngine(fallback=ScriptedEngine())
     return ScriptedEngine()
