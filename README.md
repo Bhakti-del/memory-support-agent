@@ -28,7 +28,7 @@ cd ~/Downloads/memory-support-agent
 source .venv/bin/activate
 
 python demo.py                       # guided narrative demo, no setup
-python -m pytest tests -q            # 63 tests, all passing
+python -m pytest tests -q            # 71 tests, all passing
 uvicorn api:app --reload --port 8000 # REST backend + /docs
 streamlit run ui.py                  # web UI
 ```
@@ -455,11 +455,11 @@ instead of the customer wondering whether the agent was listening.
 
 ## Tests
 
-63 total, no network, ~0.8s. `tests/test_agent.py` covers the agent,
+71 total, no network, ~0.8s. `tests/test_agent.py` covers the agent,
 `tests/test_backends.py` covers the two pluggable backends, `tests/test_ui.py`
 covers the UI (see the Streamlit section above).
 
-### `tests/test_agent.py` — 38 tests
+### `tests/test_agent.py` — 41 tests
 
 The first five map one-to-one onto the problem statement's success criteria:
 
@@ -525,6 +525,20 @@ The incident lifecycle went wrong three separate ways, and each has a test:
 | `test_a_solved_problem_is_closed_so_the_next_one_can_be_logged` | one open incident swallowing every later complaint |
 | `test_a_resolved_problem_is_not_offered_back_as_a_fix` | quoting a resolved problem back under "this worked" |
 
+A fourth defect, found by demoing rather than by testing: verdicts were read
+per clause, so a message holding both a failure and a success in one clause gave
+the first signal to every step. `"cleared the cache, still crashing, updated the
+app and it fixed it"` stored the working update as a failure, and the agent then
+told the customer every step had failed — including the one that fixed it. Each
+step now takes the nearest outcome signal that follows it, so punctuation is not
+required between a failure and a fix.
+
+| Test | Prevents |
+|---|---|
+| `test_a_fix_after_a_failure_in_the_same_clause_is_not_swallowed` | a working step stored as a failure |
+| `test_an_unpunctuated_rundown_keeps_the_fix_at_the_end` | the same, written the way a customer actually types |
+| `test_a_step_between_two_signals_is_judged_by_the_nearer_one` | position ignored when signals straddle a step |
+
 ### `tests/test_ui.py` — 7 tests
 
 Drives the real widget tree via Streamlit's `AppTest`. Empty state, generic
@@ -532,7 +546,7 @@ first answer, the conversation filling the memory panel with no form involved,
 the learned caption, the returning-customer reply, chat persistence across
 reruns, and cross-customer isolation.
 
-### `tests/test_backends.py` — 18 tests
+### `tests/test_backends.py` — 23 tests
 
 The two things this system cannot run in a demo are the only things that used to
 be untested: a model call and a memory server. Both are now tested at their seam,
@@ -554,6 +568,18 @@ with the client and the HTTP transport injected.
 - One **end-to-end** test runs a whole conversation against a canned Hindsight
   server, which is the actual claim of the `MemoryStore` protocol: swapping
   backends changes no agent code.
+- **SDK drift is a real failure mode, and it had teeth.** Anthropic removed
+  `temperature` from `messages.create` in SDK 1.9.0, so every live call raised
+  `TypeError` — and no test caught it, because the other tests inject a fake
+  client that accepts any kwarg. The engine now inspects the installed client's
+  signature and sends the parameter only when it is accepted; one test pins a
+  client that rejects it, one pins one that requires it, and one runs the whole
+  suite's fixture against the real installed package.
+- **An unreachable model must not take down the page.** A failed call —
+  exhausted credits, network blip, rate limit — falls back to the scripted
+  engine and records `degraded_reason`; the UI surfaces it in the environment
+  strip rather than as a page-wide warning. A support console should degrade
+  visibly and keep answering from memory, not crash on a billing error.
 
 **What these do not prove:** that Anthropic or Hindsight actually accepts this
 contract. A real integration test needs a real service and real credentials.
