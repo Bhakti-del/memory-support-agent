@@ -1,13 +1,21 @@
 """Contract tests for the two pluggable backends.
 
 Both `LLMEngine` and `HindsightStore` are the parts of this system that cannot
-run in the demo: one needs an API key, the other needs a memory server. Left
-untested they are the two places a bug hides until the morning of the demo.
+run without credentials: one needs an API key, the other needs a Hindsight
+instance. Left untested they are the two places a bug hides until the morning
+of the demo.
 
 So both are tested at their seam instead of against the real thing. The model
-client and the HTTP transport are injected, and the tests assert on what
-actually goes over the wire: which endpoint, which method, which body, and how
-the response is parsed. No key, no network, no server.
+client and the Hindsight client are injected, and the tests assert on the calls
+that would be made: method, arguments, metadata, and how the response is
+parsed back. No key, no network, no server.
+
+The Hindsight assertions are pinned to the real `hindsight-client` surface
+(`retain`, `recall`, `reflect`, `list_memories`, `list_banks`,
+`clear_memories`) as documented at https://hindsight.vectorize.io. An earlier
+version of this file asserted a guessed REST contract -- `POST /memories`,
+`POST /recall` -- that does not exist; the guess was replaced after reading the
+docs, which is the only reason these tests are worth having.
 
 What these do NOT prove: that Anthropic or Hindsight accepts this. A real
 contract test needs a real service. `tests/test_agent.py` covers the behaviour
@@ -16,7 +24,10 @@ that sits on top of both.
 
 from __future__ import annotations
 
+import inspect
 import json
+from datetime import datetime
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -200,86 +211,231 @@ def _hindsight(responder) -> tuple[HindsightStore, list[httpx.Request]]:
                           client=client), seen
 
 
-def test_hindsight_writes_a_memory_to_the_documented_endpoint():
-    store, seen = _hindsight(lambda r: httpx.Response(201, json={"ok": True}))
+class _Banks:
+    """The async-only ``client.banks`` namespace, as the real client exposes it."""
+
+    def __init__(self, outer: "FakeHindsight") -> None:
+        self._outer = outer
+
+    async def list_banks(self, **kwargs):
+        self._outer.calls.append(("banks.list_banks", kwargs))
+        return SimpleNamespace(banks=[SimpleNamespace(bank_id=b)
+                                      for b in self._outer.memories])
+
+
+class FakeHindsight:
+    """Stand-in for ``hindsight_client.Hindsight``, recording every call.
+
+    Pinned to the real client's surface after reading the installed package
+    rather than the docs, which is how three mistakes were caught: ``retain``
+    types ``metadata`` as ``dict[str, str]`` and ``timestamp`` as a
+    ``datetime``, and both ``list_banks`` and ``clear_bank_memories`` exist
+    only on the async namespaces. An earlier version of this file asserted a
+    guessed REST contract -- ``POST /memories``, ``POST /recall`` -- that does
+    not exist at all.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.memories: dict[str, list[dict]] = {}
+        self.raise_on: set[str] = set()
+        self.banks = _Banks(self)
+
+    def _call(self, name: str, **kwargs):
+        self.calls.append((name, kwargs))
+        if name in self.raise_on:
+            raise RuntimeError(f"hindsight {name} failed")
+        return kwargs
+
+    def retain(self, **kwargs):
+        self._call("retain", **kwargs)
+        self.memories.setdefault(kwargs["bank_id"], []).append(
+            {"text": kwargs["content"], "metadata": dict(kwargs.get("metadata") or {}),
+             "id": kwargs.get("document_id"), "created_at": kwargs.get("timestamp")}
+        )
+        return {"ok": True}
+
+    def recall(self, **kwargs):
+        self._call("recall", **kwargs)
+        rows = self.memories.get(kwargs["bank_id"], [])
+        return SimpleNamespace(results=[SimpleNamespace(text=r["text"],
+                                                        metadata=r["metadata"],
+                                                        score=0.9 - i * 0.1)
+                                        for i, r in enumerate(rows[:3])])
+
+    def reflect(self, **kwargs):
+        self._call("reflect", **kwargs)
+        return SimpleNamespace(text="reflected")
+
+    def list_memories(self, **kwargs):
+        self._call("list_memories", **kwargs)
+        return SimpleNamespace(items=list(self.memories.get(kwargs["bank_id"], [])))
+
+    def delete_bank(self, bank_id: str, **kwargs):
+        self._call("delete_bank", bank_id=bank_id, **kwargs)
+        self.memories.pop(bank_id, None)
+
+    def names(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+
+def _store(fake: FakeHindsight) -> HindsightStore:
+    return HindsightStore(base_url="http://hindsight.test", client=fake)
+
+
+def test_each_customer_gets_their_own_hindsight_bank():
+    """Banks are fully isolated inside Hindsight, so per-customer isolation is
+    the service's guarantee rather than a filter the adapter must remember."""
+    store = _store(FakeHindsight())
+    assert store.bank_for("CUST-1042") == "support-cust-1042"
+    assert store.bank_for("CUST-9999") != store.bank_for("CUST-1042")
+
+
+def test_hindsight_writes_a_memory_through_retain():
+    fake = FakeHindsight()
     memory = Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT,
                     text="Update application", outcome=Outcome.WORKED)
-    store.add(memory)
+    _store(fake).add(memory)
 
-    request = seen[0]
-    assert request.method == "POST"
-    assert request.url.path == "/memories"
-    body = json.loads(request.content)
-    assert body["bank"] == "support"
-    assert body["customer_id"] == "CUST-1"
-    assert body["memory"]["text"] == "Update application"
-    assert body["memory"]["outcome"] == "worked"
+    name, kwargs = fake.calls[0]
+    assert name == "retain"
+    assert kwargs["bank_id"] == "support-cust-1"
+    assert kwargs["content"] == "Update application"
+    # Structured fields ride along as metadata so recall never has to re-parse
+    # prose to learn an outcome -- this is what keeps fixes separable from
+    # failures against a service that returns plain fact text.
+    assert kwargs["metadata"]["outcome"] == "worked"
+    assert kwargs["metadata"]["kind"] == "attempt"
+    assert kwargs["metadata"]["customer_id"] == "CUST-1"
+    # The installed client types metadata as dict[str, str] and timestamp as a
+    # datetime, so neither may be sent as a list or an ISO string.
+    assert all(isinstance(v, str) for v in kwargs["metadata"].values())
+    assert isinstance(kwargs["timestamp"], datetime)
+    # Synchronous retain: the caller expects it recallable on the next turn.
+    assert kwargs["retain_async"] is False
+
+
+def test_symptom_terms_survive_the_string_metadata_round_trip():
+    """They go over the wire comma-joined, so the split is the only thing
+    keeping a generic step retrievable by the words the customer used."""
+    fake = FakeHindsight()
+    store = _store(fake)
+    store.add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT, text="Restart application",
+                     symptom_terms=["crash", "pdf", "upload"]))
+    assert store.all("CUST-1")[0].symptom_terms == ["crash", "pdf", "upload"]
 
 
 def test_hindsight_reads_back_a_memory_the_server_stored():
-    record = Memory(customer_id="CUST-1", kind=MemoryKind.INCIDENT,
-                    text="crashes on large PDF upload").to_dict()
-    store, seen = _hindsight(lambda r: httpx.Response(200, json={"memories": [record]}))
+    fake = FakeHindsight()
+    store = _store(fake)
+    memory = Memory(customer_id="CUST-1", kind=MemoryKind.INCIDENT,
+                    text="crashes on large PDF upload")
+    store.add(memory)
 
-    memories = store.all("CUST-1")
+    recalled = store.all("CUST-1")
 
-    assert seen[0].url.path == "/memories"
-    assert seen[0].url.params["customer_id"] == "CUST-1"
-    assert seen[0].url.params["bank"] == "support"
-    assert [m.text for m in memories] == ["crashes on large PDF upload"]
-    # Round-tripping is the coupling point: a shape the server does not return
-    # would otherwise blow up deep inside the agent, not at the boundary.
-    assert memories[0].kind is MemoryKind.INCIDENT
+    # An empty query is a listing, not a semantic search -- asking Hindsight to
+    # recall on "" returns nothing useful.
+    assert fake.names() == ["retain", "list_memories"]
+    assert recalled[0].kind is MemoryKind.INCIDENT
+    assert recalled[0].customer_id == "CUST-1"
+    assert recalled[0].id == memory.id
 
 
 def test_hindsight_delegates_recall_to_the_server():
-    record = Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT,
-                    text="Update application", outcome=Outcome.WORKED).to_dict()
-    store, seen = _hindsight(
-        lambda r: httpx.Response(200, json={"results": [{"memory": record, "score": 0.82}]})
-    )
+    fake = FakeHindsight()
+    store = _store(fake)
+    store.add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT,
+                     text="Update application", outcome=Outcome.WORKED))
 
-    results = store.search("CUST-1", "crashes on large PDF", limit=3)
+    results = store.search("CUST-1", "crashes on large PDF")
 
-    body = json.loads(seen[0].content)
-    assert seen[0].method == "POST"
-    assert seen[0].url.path == "/recall"
-    assert body == {"bank": "support", "customer_id": "CUST-1",
-                    "query": "crashes on large PDF", "limit": 3}
-    assert results[0][1] == 0.82
+    _, kwargs = [c for c in fake.calls if c[0] == "recall"][0]
+    assert kwargs["bank_id"] == "support-cust-1"
+    assert kwargs["query"] == "crashes on large PDF"
     assert results[0][0].text == "Update application"
+    assert results[0][0].outcome is Outcome.WORKED
+    assert 0 < results[0][1] <= 1
 
 
-def test_hindsight_lists_customers_per_bank():
-    store, seen = _hindsight(lambda r: httpx.Response(200, json={"customers": ["CUST-1"]}))
-    assert store.customers() == ["CUST-1"]
-    assert seen[0].url.path == "/banks/support/customers"
+def test_hindsight_lists_customers_by_bank_prefix():
+    fake = FakeHindsight()
+    store = _store(fake)
+    store.add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT, text="Restart"))
+    store.add(Memory(customer_id="CUST-2", kind=MemoryKind.ATTEMPT, text="Reinstall"))
+
+    assert store.customers() == ["cust-1", "cust-2"]
 
 
-def test_hindsight_update_targets_one_memory_by_id():
-    """Resolving an incident is an in-place edit, so it must not append."""
-    store, seen = _hindsight(lambda r: httpx.Response(200, json={"ok": True}))
-    memory = Memory(customer_id="CUST-1", kind=MemoryKind.INCIDENT,
-                    text="crashes on large PDF", outcome=Outcome.WORKED)
-    store.update(memory)
+def test_hindsight_forget_clears_one_customers_bank():
+    fake = FakeHindsight()
+    store = _store(fake)
+    store.add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT, text="Restart"))
+    store.add(Memory(customer_id="CUST-2", kind=MemoryKind.ATTEMPT, text="Reinstall"))
 
-    assert seen[0].method == "PUT"
-    assert seen[0].url.path == f"/memories/{memory.id}"
-
-
-def test_hindsight_forget_deletes_a_customer():
-    store, seen = _hindsight(lambda r: httpx.Response(200, json={"removed": 7}))
-    assert store.forget("CUST-1") == 7
-    assert seen[0].method == "DELETE"
-    assert seen[0].url.params["customer_id"] == "CUST-1"
+    assert store.forget("CUST-1") == 1
+    assert "delete_bank" in fake.names()
+    # The other customer's bank is untouched.
+    assert store.all("CUST-2")[0].text == "Reinstall"
 
 
 def test_hindsight_surfaces_a_server_error_instead_of_returning_nothing():
-    """A 500 must not read as 'this customer has no memory'. That would look
-    like a recall failure and quietly change what the agent says."""
-    store, _ = _hindsight(lambda r: httpx.Response(500, json={"error": "boom"}))
-    with pytest.raises(httpx.HTTPStatusError):
-        store.all("CUST-1")
+    """A failing service must not read as 'this customer has no memory'. That
+    would look like a recall failure and quietly change what the agent says."""
+    fake = FakeHindsight()
+    fake.raise_on = {"retain"}
+    with pytest.raises(RuntimeError, match="retain failed"):
+        _store(fake).add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT, text="x"))
+
+
+def test_a_record_missing_metadata_degrades_instead_of_raising():
+    """One absent field must not lose the whole recall."""
+    fake = FakeHindsight()
+    fake.memories["support-cust-1"] = [{"text": "Update application", "metadata": {}}]
+    memories = _store(fake).all("CUST-1")
+    assert memories[0].text == "Update application"
+    assert memories[0].kind is MemoryKind.NOTE
+
+
+def test_the_adapter_only_calls_methods_the_installed_client_has():
+    """Pin the adapter to the real package, not to a hand-written double.
+
+    The docs and the installed `hindsight-client` disagree in three places --
+    `list_banks` and `clear_bank_memories` are async-only namespace methods,
+    `metadata` is `dict[str, str]`, and `timestamp` is a `datetime`. A fake
+    that mirrors the adapter proves nothing, so this asserts against whatever
+    `pip install hindsight-client` actually gives us. It skips rather than
+    fails when the optional dependency is absent, so a judge can still run the
+    suite with no extras.
+    """
+    client_mod = pytest.importorskip("hindsight_client")
+    from memory_agent import store as store_mod
+
+    for method in ("retain", "recall", "reflect", "list_memories", "delete_bank"):
+        assert hasattr(client_mod.Hindsight, method), f"client lost {method}"
+    assert hasattr(client_mod.Hindsight(base_url="http://x").banks, "list_banks")
+
+    source = inspect.getsource(store_mod.HindsightStore)
+    # keyword arguments the adapter passes, checked against the real signature
+    import re
+
+    for match in re.finditer(r"self\._client\.(\w+)\(", source):
+        name = match.group(1)
+        assert hasattr(client_mod.Hindsight, name), f"adapter calls missing {name}"
+
+    retain_params = inspect.signature(client_mod.Hindsight.retain).parameters
+    assert str(retain_params["metadata"].annotation) == "dict[str, str] | None"
+    assert str(retain_params["timestamp"].annotation) == "datetime.datetime | None"
+
+
+def test_retain_is_sent_with_the_types_the_client_declares():
+    """The string-metadata and datetime-timestamp rules, enforced end to end."""
+    fake = FakeHindsight()
+    _store(fake).add(Memory(customer_id="CUST-1", kind=MemoryKind.ATTEMPT,
+                            text="Restart application", symptom_terms=["crash"]))
+    _, kwargs = fake.calls[0]
+    assert isinstance(kwargs["timestamp"], datetime)
+    assert all(isinstance(v, str) for v in kwargs["metadata"].values())
 
 
 def test_hindsight_store_refuses_to_build_without_a_url(monkeypatch):
@@ -290,8 +446,8 @@ def test_hindsight_store_refuses_to_build_without_a_url(monkeypatch):
 
 def test_hindsight_is_selected_when_configured(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_URL", "http://hindsight.test")
+    monkeypatch.setattr("hindsight_client.Hindsight", lambda **kw: FakeHindsight())
     assert isinstance(build_store(), HindsightStore)
-
 
 def test_local_store_is_the_default_without_configuration(monkeypatch):
     """Same reason as the scripted engine: a judge runs it with no env set."""
@@ -304,42 +460,24 @@ def test_local_store_is_the_default_without_configuration(monkeypatch):
 # ---------------------------------------------- the agent over a remote store
 
 
-def test_agent_works_unchanged_over_the_remote_store(monkeypatch):
+def test_agent_works_unchanged_over_the_remote_store():
     """The point of the MemoryStore protocol: `SupportAgent` is written against
     the interface, so swapping backends changes no agent code. This runs the
-    full conversation against a canned Hindsight server.
+    full conversation against a fake Hindsight service.
 
-    The store double here deliberately ignores lexical scoring, unlike
-    InMemoryStore, because a real service does its own retrieval. The agent's
-    contribution -- extract, store, resolve incidents, report what it learned --
-    is unchanged either way.
+    The fake deliberately ignores lexical scoring, unlike InMemoryStore,
+    because a real service does its own retrieval. The agent's contribution --
+    extract, store, resolve incidents, report what it learned -- is unchanged
+    either way.
     """
-    records: dict[str, list[dict]] = {}
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content or b"{}")
-        cid = body.get("customer_id") or request.url.params.get("customer_id", "")
-        if request.method == "POST" and request.url.path == "/memories":
-            records.setdefault(cid, []).append(body["memory"])
-            return httpx.Response(201, json={"ok": True})
-        if request.method == "GET" and request.url.path == "/memories":
-            return httpx.Response(200, json={"memories": records.get(cid, [])})
-        if request.method == "POST" and request.url.path == "/recall":
-            return httpx.Response(200, json={"results": []})
-        if request.method == "DELETE":
-            removed = len(records.pop(cid, []))
-            return httpx.Response(200, json={"removed": removed})
-        return httpx.Response(200, json={})
-
-    client = httpx.Client(transport=httpx.MockTransport(handle))
-    store = HindsightStore(base_url="http://hindsight.test", client=client)
+    store = _store(FakeHindsight())
     agent = SupportAgent(store=store)
 
     agent.ask("CUST-1", "My Acme PDF Suite crashes whenever I upload a large PDF")
     reply = agent.ask("CUST-1", "I restarted it but that did not help")
     reply = agent.ask("CUST-1", "Updated the app and it fixed it")
 
-    stored = [Memory.from_dict(r) for r in records["CUST-1"]]
+    stored = store.all("CUST-1")
     attempts = {m.text: m.outcome for m in stored if m.kind is MemoryKind.ATTEMPT}
     assert attempts == {
         "Restart application": Outcome.FAILED,
@@ -347,5 +485,10 @@ def test_agent_works_unchanged_over_the_remote_store(monkeypatch):
     }
     # The fix the customer just reported is acknowledged, not escalated.
     assert "escalate" not in reply.text.lower()
-    # And a second customer on the same service sees nothing of the first.
-    assert agent.ask("CUST-2", "the app crashes again").is_returning_customer is False
+    # And a second customer on the same service sees nothing of the first:
+    # separate banks, so CUST-1's fix is not even in the store being searched.
+    fresh = agent.ask("CUST-2", "the app crashes again")
+    assert fresh.is_returning_customer is False
+    assert all(r.memory.customer_id == "CUST-2" for r in fresh.used_memories)
+    assert [m.customer_id for m in store.all("CUST-1")] == ["CUST-1"] * len(store.all("CUST-1"))
+    assert all("CUST-1" not in (m.customer_id,) for m in store.all("CUST-2"))

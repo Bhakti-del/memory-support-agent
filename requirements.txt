@@ -3,5 +3,6 @@ uvicorn>=0.30
 streamlit>=1.40
 pydantic>=2.8
 httpx>=0.27
+hindsight-client>=0.1
 anthropic>=1.9
 pytest>=8.0

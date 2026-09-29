@@ -341,31 +341,60 @@ mutates rather than appends: resolving an open incident.
 
 ### `HindsightStore` (set `HINDSIGHT_URL`)
 
-HTTP adapter to a real Hindsight memory service. Same five methods, but recall
-is delegated to the server's retriever instead of local lexical scoring, and
-writes go to a named bank rather than a file.
+Adapter to a real [Hindsight](https://hindsight.vectorize.io) memory service.
+Same six methods, but recall is delegated to Hindsight's own retriever
+(semantic + BM25 + entity graph + temporal, fused by RRF) instead of local
+lexical scoring.
+
+**One memory bank per customer.** Banks are fully isolated inside Hindsight, so
+CUST-1's memories are not merely filtered out of CUST-2's search — they are in
+a different container the search never touches. Isolation is the service's
+guarantee, not something the adapter has to remember to apply.
 
 ```bash
-export HINDSIGHT_URL=http://localhost:8765
-export HINDSIGHT_BANK=support
+pip install hindsight-client
+
+export HINDSIGHT_URL=http://localhost:8888        # Hindsight Cloud, or local
+export HINDSIGHT_API_KEY=...                      # Cloud only; omit for local
+export HINDSIGHT_BANK_PREFIX=support              # banks become support-cust-1042
 ```
 
-Expected service surface (the endpoints the adapter calls):
+Client calls the adapter makes, per the installed `hindsight-client`:
 
-| Endpoint | Body / query | Returns |
-|---|---|---|
-| `POST /memories` | `{bank, customer_id, memory}` | — |
-| `PUT /memories/{id}` | `{bank, customer_id, memory}` | — |
-| `GET /memories` | `?bank&customer_id` | `{memories: [...]}` |
-| `GET /banks/{bank}/customers` | — | `{customers: [...]}` |
-| `POST /recall` | `{bank, customer_id, query, limit}` | `{results: [{memory, score}]}` |
+| Call | Purpose |
+|---|---|
+| `retain(bank_id, content, context, timestamp, document_id, metadata, retain_async=False)` | store a memory |
+| `recall(bank_id, query, max_tokens, budget)` | search the customer's bank |
+| `list_memories(bank_id, limit)` | list what a bank holds (`all()`) |
+| `delete_bank(bank_id)` | forget one customer |
+| `reflect(bank_id, query, context)` | Hindsight-side reasoning, exposed but not on the demo path |
+| `await client.banks.list_banks()` | list customers by bank prefix |
+
+Three details the docs get wrong, all caught by
+`test_the_adapter_only_calls_methods_the_installed_client_has`:
+
+- `list_banks` and `clear_bank_memories` are **async-only**, on the
+  `client.banks` / `client.memory` namespaces. The adapter drives them with
+  `asyncio.run`, on a worker thread if a loop is already running.
+- `retain`'s `metadata` is typed `dict[str, str]`, so the symptom terms go over
+  the wire comma-joined and are split again on recall. Sending a list is a
+  type error at the boundary.
+- `retain`'s `timestamp` is a `datetime`, not an ISO string.
+
+**Resolution by append, not overwrite.** Hindsight's model is
+append-and-consolidate: a corrected fact is superseded by retaining the newer
+one, and consolidation resolves the two into an observation that carries the
+history. `update()` therefore retains the resolved state rather than mutating a
+row — the client does expose `memory.update_memory`, but it is async-only and
+retaining is closer to how Hindsight wants conflict resolution to work.
 
 `/health` reports which backend is live, so a demo failure is never mistaken
 for a memory bug.
 
-**To connect a real Hindsight service:** match those five routes, and confirm
-`Memory.from_dict` accepts its record shape. `models.py` is the only coupling
-point. `SupportAgent` calls the protocol, never the implementation.
+**What is still unverified:** no real Hindsight instance has been run against
+this. The client surface is pinned to the installed package, but the server's
+own behaviour — extract quality, consolidation, embeddings — is untested. Get an
+instance and exercise it before the demo.
 
 Both pluggable backends are tested without credentials — see
 `tests/test_backends.py`.
