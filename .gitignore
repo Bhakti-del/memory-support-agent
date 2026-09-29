@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime memory written by the UI and API. Local state, not source.
+memory_store.json
+
+# Never commit credentials. The backends read these from the environment.
+.env
+.env.*
+*.pem
+
+# macOS
+.DS_Store
